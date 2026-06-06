@@ -5,12 +5,14 @@ on:
   workflow_dispatch:
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # 消除Node20警告
+  UPSTREAM_REPO: https://github.com/Gloridust/WechatOnCloud.git
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
 
 permissions:
-  contents: write
-  packages: write
-  workflows: write  # 新增：允许修改workflow配置文件，解决推送被拒
+  contents: write  # 核心权限：允许读写仓库内容
+  packages: write  # 允许操作GHCR镜像
 
 jobs:
   auto-sync-release:
@@ -22,14 +24,44 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Sync official source code
-        uses: repo-sync/github-sync@v2
-        with:
-          source_repo: Gloridust/WechatOnCloud
-          source_branch: main
-          destination_branch: main
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          sync_tags: true
+      - name: Configure Git and sync upstream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          # 配置Git身份
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 添加上游仓库
+          git remote add upstream "$UPSTREAM_REPO" || true
+          git fetch upstream
+          
+          # 关键：创建临时分支，仅合并非workflow目录的变更
+          git checkout -B temp-sync-branch "$TARGET_BRANCH"
+          
+          # 合并上游代码，排除.github/workflows目录
+          git merge --allow-unrelated-histories -X theirs upstream/"$UPSTREAM_BRANCH" \
+            --no-commit --no-ff
+          
+          # 恢复被覆盖的workflow文件（如果有）
+          if [ -d ".github/workflows" ]; then
+            git checkout HEAD -- .github/workflows/
+            echo "✅ 已保护本地workflow配置，未被上游覆盖"
+          fi
+          
+          # 完成合并并提交
+          git commit -m "Auto sync from upstream: $(git log --format=%h -n 1 upstream/$UPSTREAM_BRANCH)" || {
+            echo "✅ 无新变更，跳过提交"
+            git checkout "$TARGET_BRANCH"
+            git branch -D temp-sync-branch
+            exit 0
+          }
+          
+          # 推送变更
+          git push origin temp-sync-branch:"$TARGET_BRANCH"
+          git checkout "$TARGET_BRANCH"
+          git branch -D temp-sync-branch
 
       - name: Auto create tag and release
         env:
@@ -37,6 +69,7 @@ jobs:
         run: |
           set -e
           git fetch --tags
+          # 查找最新版本号
           NEW_VER=$(git tag -l "v*.*.*" | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | sort -V | tail -n 1)
 
           if [ -z "$NEW_VER" ]; then
@@ -45,15 +78,16 @@ jobs:
           fi
           echo "🔍 检测到官方最新版本: $NEW_VER"
 
+          # 检查版本是否已存在
           if git rev-parse "$NEW_VER" >/dev/null 2>&1; then
             echo "✅ 版本 $NEW_VER 已存在，无需重复发布"
             exit 0
           fi
 
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          # 创建并推送标签
           git tag "$NEW_VER"
           git push origin "$NEW_VER"
 
+          # 创建GitHub Release
           gh release create "$NEW_VER" --title "$NEW_VER" --generate-notes --latest
           echo "🚀 发布成功，触发镜像构建"
