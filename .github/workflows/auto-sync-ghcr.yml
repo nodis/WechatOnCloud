@@ -18,8 +18,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
+      # 版本从v3改为v2（官方有效标签）
       - name: Sync with official WechatOnCloud
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3
+        uses: aormsby/Fork-Sync-With-Upstream-action@v2
         with:
           upstream_repository: Gloridust/WechatOnCloud
           target_repository: ${{ github.repository }}
