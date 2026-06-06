@@ -4,9 +4,13 @@ on:
     - cron: '0 19 * * *'
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: write
   packages: write
+  workflows: write  # 新增：允许修改workflow配置文件，解决推送被拒
 
 jobs:
   auto-sync-release:
@@ -25,9 +29,7 @@ jobs:
           source_branch: main
           destination_branch: main
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          # 关键配置：排除工作流文件夹，不同步官方workflow文件
-          exclude: |
-            .github/workflows/
+          sync_tags: true
 
       - name: Auto create tag and release
         env:
