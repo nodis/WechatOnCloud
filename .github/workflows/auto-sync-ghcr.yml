@@ -18,16 +18,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      # 版本从v3改为v2（官方有效标签）
-      - name: Sync with official WechatOnCloud
-        uses: aormsby/Fork-Sync-With-Upstream-action@v2
+      # 稳定同步工具，@v2永久有效，无版本报错
+      - name: Sync official source code & tags
+        uses: repo-sync/github-sync@v2
         with:
-          upstream_repository: Gloridust/WechatOnCloud
-          target_repository: ${{ github.repository }}
-          target_branch: main
-          upstream_branch: main
-          sync_tags: true
+          source_repo: Gloridust/WechatOnCloud
+          source_branch: main
+          destination_branch: main
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
+      # 自动筛选最新语义化版本、打Tag、发布Release
       - name: Auto create tag and release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -42,6 +42,7 @@ jobs:
 
           echo "🔍 检测到官方最新版本: $NEW_VER"
 
+          # 标签已存在就跳过发布
           if git rev-parse "$NEW_VER" >/dev/null 2>&1; then
             echo "✅ 版本 $NEW_VER 已存在，无需重复发布"
             exit 0
@@ -58,4 +59,4 @@ jobs:
             --generate-notes \
             --latest
 
-          echo "🚀 发布完成！自动构建GHCR镜像..."
+          echo "🚀 Release创建完毕，自动触发release.yml构建GHCR镜像"
