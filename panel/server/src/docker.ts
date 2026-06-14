@@ -435,7 +435,7 @@ const DEFAULT_STATUS: WechatStatus = { phase: 'idle', percent: 0, installed: fal
 
 export async function wechatStatus(inst: Instance): Promise<WechatStatus> {
   try {
-    const raw = await execCapture(inst, ['/woc/wechat-ctl.sh', 'status']);
+    const raw = await execCapture(inst, ['/woc/app-ctl.sh', instanceAppType(inst), 'status']);
     const json = JSON.parse(raw.trim());
     return { ...DEFAULT_STATUS, ...json };
   } catch {
