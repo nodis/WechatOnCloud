@@ -1,9 +1,10 @@
 import { hostname } from 'node:os';
 import { existsSync, readdirSync } from 'node:fs';
+import { appendInstanceLog, deleteInstanceLog, appendPanelLog, readInstanceLog, readPanelLog, filterSince } from './logs.js';
 import http from 'node:http';
 import zlib from 'node:zlib';
 import Docker from 'dockerode';
-import type { Instance } from './store.js';
+import { instanceAppType, type Instance } from './store.js';
 
 const WECHAT_IMAGE = process.env.WOC_WECHAT_IMAGE || 'ghcr.io/gloridust/wechat-on-cloud:latest';
 const PUID = process.env.PUID || '1000';
@@ -114,6 +115,11 @@ function envList(inst: Instance): string[] {
   if (!ENABLE_GPU) env.push('DISABLE_DRI=1');
   // 透传 os 伪装开关给容器内的 00-woc-identity 钩子（决定是否把 /etc/os-release 改成 deepin）。
   env.push(`WOC_SPOOF_OS=${SPOOF_OS ? '1' : '0'}`);
+  // v1.2.0 多应用：透传应用类型给 02-woc-app 钩子（写入 /config/.woc-app，autostart 据此启动）。
+  // 老实例无 appType → instanceAppType 回退 wechat；自定义应用额外透传启动命令。
+  const appType = instanceAppType(inst);
+  env.push(`WOC_APP_TYPE=${appType}`);
+  if (appType === 'custom' && inst.customLaunch) env.push(`WOC_CUSTOM_LAUNCH=${inst.customLaunch}`);
   return env;
 }
 
@@ -125,7 +131,17 @@ async function ensureImage(): Promise<void> {
   } catch {
     /* 本地没有，下面拉取 */
   }
-  await pullImage();
+  // 首次新建实例常卡在这一步（NAS 直连 docker.io 拉取超时，见 README）。这里前后都打日志：
+  // 若诊断包里只见"开始拉取"而无"完成/失败"，即可定位为拉取卡死。
+  appendPanelLog('INFO', `本地无实例镜像 ${WECHAT_IMAGE}，开始拉取（首次较慢；NAS 直连 docker.io 可能超时）…`);
+  const t0 = Date.now();
+  try {
+    await pullImage();
+    appendPanelLog('INFO', `实例镜像拉取完成 ${WECHAT_IMAGE}（耗时 ${Math.round((Date.now() - t0) / 1000)}s）`);
+  } catch (e: any) {
+    appendPanelLog('ERROR', `实例镜像拉取失败 ${WECHAT_IMAGE}（耗时 ${Math.round((Date.now() - t0) / 1000)}s）：${e?.message || e}`);
+    throw e;
+  }
 }
 
 // 创建并启动一个微信实例容器。若同名容器已存在则先移除（仅容器，不动卷）。
@@ -135,6 +151,8 @@ export async function runInstance(inst: Instance): Promise<void> {
   try {
     const existing = docker.getContainer(inst.containerName);
     await existing.inspect();
+    // 删除前先把旧容器最后日志快照进持久日志，否则随容器删除就看不到"上次为何停/崩"。
+    await snapshotContainerLog(inst, '容器重建（重启/升级/自愈），保留上一容器最后日志');
     await existing.remove({ force: true });
   } catch {
     /* 不存在，正常 */
@@ -178,6 +196,7 @@ export async function runInstance(inst: Instance): Promise<void> {
   const container = await docker.createContainer(createOpts);
   try {
     await container.start();
+    appendInstanceLog(inst.id, '容器已启动');
   } catch (e) {
     // 启动失败但容器已被创建出来（Created 状态），不清理的话会成为"幽灵容器"——
     // 它仍占着卷名 woc-data-<id>，让后续删卷报 409。修复 #23 时发现 4 个此类残留。
@@ -236,6 +255,7 @@ export async function regenInstanceMachineId(inst: Instance): Promise<void> {
 export async function stopInstance(inst: Instance): Promise<void> {
   try {
     await docker.getContainer(inst.containerName).stop({ t: 5 } as any);
+    appendInstanceLog(inst.id, '容器已停止');
   } catch {
     /* 已停止或不存在 */
   }
@@ -254,6 +274,7 @@ export async function removeInstance(inst: Instance, purgeVolume: boolean): Prom
     } catch {
       /* 卷可能不存在 */
     }
+    deleteInstanceLog(inst.id); // 彻底删除时一并清掉持久日志
   }
 }
 
@@ -404,11 +425,15 @@ async function execCapture(inst: Instance, cmd: string[]): Promise<string> {
   });
 }
 
-// 触发下载/安装（detached，立即返回，后台下载）。
+// 触发下载/安装（detached，立即返回，后台下载）。按实例 appType 分发：app-ctl.sh wechat → 委托回
+// wechat-ctl.sh；telegram 等各自实现。兼容旧容器（升级前镜像里没有 /woc/app-ctl.sh）：有则用之，无则
+// 回退老的 wechat-ctl.sh（旧实例都是微信）。appType 取值受 instanceAppType 约束，可安全内插进 shell。
 export async function triggerWechat(inst: Instance, cmd: 'install' | 'update'): Promise<void> {
   const c = docker.getContainer(inst.containerName);
+  const at = instanceAppType(inst);
+  const action = cmd === 'update' ? 'update' : 'install';
   const exec = await c.exec({
-    Cmd: ['/woc/wechat-ctl.sh', cmd === 'update' ? 'update' : 'install'],
+    Cmd: ['bash', '-c', `if [ -x /woc/app-ctl.sh ]; then /woc/app-ctl.sh ${at} ${action}; else /woc/wechat-ctl.sh ${action}; fi`],
     AttachStdout: false,
     AttachStderr: false,
     User: 'abc',
@@ -429,7 +454,13 @@ const DEFAULT_STATUS: WechatStatus = { phase: 'idle', percent: 0, installed: fal
 
 export async function wechatStatus(inst: Instance): Promise<WechatStatus> {
   try {
-    const raw = await execCapture(inst, ['/woc/wechat-ctl.sh', 'status']);
+    // 兼容旧容器（无 /woc/app-ctl.sh）：有则按 appType 取状态，无则回退老的 wechat-ctl.sh（旧实例皆微信）。
+    const at = instanceAppType(inst);
+    const raw = await execCapture(inst, [
+      'bash',
+      '-c',
+      `if [ -x /woc/app-ctl.sh ]; then /woc/app-ctl.sh ${at} status; else /woc/wechat-ctl.sh status; fi`,
+    ]);
     const json = JSON.parse(raw.trim());
     return { ...DEFAULT_STATUS, ...json };
   } catch {
@@ -474,6 +505,129 @@ function tarSingleFile(name: string, content: Buffer): Buffer {
   h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148); // 真实校验和
   const pad = (512 - (content.length % 512)) % 512;
   return Buffer.concat([h, content, Buffer.alloc(pad, 0), Buffer.alloc(1024, 0)]);
+}
+
+// ---------- 诊断包 ----------
+// 单个 tar entry（USTAR header + 内容 + 512 对齐填充），复用与 tarSingleFile 相同的格式。
+function tarEntry(name: string, content: Buffer): Buffer {
+  const h = Buffer.alloc(512, 0);
+  h.write(name.slice(0, 100), 0, 'utf8');
+  h.write('0000644\0', 100);
+  h.write('0001750\0', 108);
+  h.write('0001750\0', 116);
+  h.write(content.length.toString(8).padStart(11, '0') + '\0', 124);
+  h.write('00000000000\0', 136);
+  h.write('        ', 148); // checksum 占位
+  h.write('0', 156); // typeflag 普通文件
+  h.write('ustar\0', 257);
+  h.write('00', 263);
+  let sum = 0;
+  for (let i = 0; i < 512; i++) sum += h[i];
+  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
+  const pad = (512 - (content.length % 512)) % 512;
+  return Buffer.concat([h, content, Buffer.alloc(pad, 0)]);
+}
+
+// 多文件 tar.gz（内存构建；诊断包通常仅数 MB）。文件名用 ASCII 路径避免 utf8 超 100 字节。
+function buildTarGz(entries: { name: string; content: string | Buffer }[]): Buffer {
+  const parts = entries.map((e) => tarEntry(e.name, Buffer.isBuffer(e.content) ? e.content : Buffer.from(e.content, 'utf8')));
+  parts.push(Buffer.alloc(1024, 0)); // 两个空块标记归档结束
+  return zlib.gzipSync(Buffer.concat(parts));
+}
+
+// 汇总诊断包：系统信息 + 面板全局日志 + 每个实例（容器状态 + 持久日志 + 实时日志）+ 全部 woc-* 容器清单。
+// 日志按 sinceMs 时间裁剪。给排查"首个实例创建卡死 / 打开实例黑屏不可用 / 升级失败"等问题用。
+export async function buildDiagnostics(instances: Instance[], sinceMs: number, meta: Record<string, string>): Promise<Buffer> {
+  const entries: { name: string; content: string | Buffer }[] = [];
+  const stamp = new Date().toISOString();
+
+  entries.push({
+    name: 'README.txt',
+    content: [
+      '云微 · WechatOnCloud 诊断包',
+      `生成时间: ${stamp}`,
+      `时间范围: 最近 ${meta.range || '24h'}`,
+      '',
+      '内容：',
+      '  system.txt        系统/Docker/镜像信息',
+      '  panel.log         面板全局运维日志（创建/删除/升级/启停/镜像拉取/错误）',
+      '  containers.txt    所有 woc-* 容器清单（含残留/未登记）',
+      '  instances/<id>.log 每个实例：容器状态 + 持久日志 + 实时容器日志',
+      '',
+      '把本压缩包发给维护者即可协助排查（不含密码/密钥等敏感信息）。',
+    ].join('\n'),
+  });
+
+  // 系统信息
+  let sys = `生成时间: ${stamp}\n时间范围: 最近 ${meta.range || '24h'}\n\n`;
+  for (const [k, v] of Object.entries(meta)) sys += `${k}: ${v}\n`;
+  try {
+    const ver: any = await docker.version();
+    sys += `\nDocker 版本: ${ver.Version} (API ${ver.ApiVersion}, ${ver.Os}/${ver.Arch})\n`;
+  } catch (e: any) {
+    sys += `\nDocker 版本: 获取失败 ${e?.message || e}\n`;
+  }
+  try {
+    const info: any = await docker.info();
+    sys += `容器: ${info.Containers}（运行 ${info.ContainersRunning}） · 镜像: ${info.Images}\n`;
+    sys += `内核: ${info.KernelVersion} · OS: ${info.OperatingSystem} · 架构: ${info.Architecture}\n`;
+    sys += `CPU: ${info.NCPU} 核 · 内存: ${(info.MemTotal / 1073741824).toFixed(1)} GiB\n`;
+    if (Array.isArray(info.Warnings) && info.Warnings.length) sys += `Docker 警告: ${info.Warnings.join('; ')}\n`;
+  } catch (e: any) {
+    sys += `Docker info: 获取失败 ${e?.message || e}\n`;
+  }
+  try {
+    const img: any = await docker.getImage(WECHAT_IMAGE).inspect();
+    sys += `\n实例镜像 ${WECHAT_IMAGE}: ${String(img.Id).slice(0, 19)} · 创建 ${img.Created}\n`;
+  } catch {
+    sys += `\n实例镜像 ${WECHAT_IMAGE}: 本地不存在（首次新建实例需联网拉取，可能在此卡住）\n`;
+  }
+  sys += `\n实例数: ${instances.length}\n`;
+  entries.push({ name: 'system.txt', content: sys });
+
+  // 面板全局日志（按范围裁剪）
+  entries.push({ name: 'panel.log', content: filterSince(readPanelLog(), sinceMs) || '（无面板日志）' });
+
+  // 每个实例
+  for (const inst of instances) {
+    let c = `实例: ${inst.name}\nID: ${inst.id}\n容器: ${inst.containerName}\n类型: ${instanceAppType(inst)}\n数据卷: ${inst.volumeName}\n创建: ${inst.createdAt}\n\n`;
+    try {
+      const info: any = await docker.getContainer(inst.containerName).inspect();
+      const s = info.State || {};
+      c += `===== 容器状态 =====\n运行: ${s.Running} · 状态: ${s.Status} · 退出码: ${s.ExitCode}\n`;
+      c += `OOMKilled: ${s.OOMKilled} · 重启次数: ${info.RestartCount} · 启动于: ${s.StartedAt}\n`;
+      if (s.Error) c += `错误: ${s.Error}\n`;
+      c += `镜像: ${String(info.Image).slice(0, 19)} · 健康: ${s.Health?.Status ?? 'n/a'}\n\n`;
+    } catch (e: any) {
+      c += `===== 容器状态 =====\n无法读取（容器可能未创建/已删除）：${e?.message || e}\n\n`;
+    }
+    c += `===== 持久化日志（最近 ${meta.range || '24h'}） =====\n${filterSince(readInstanceLog(inst.id), sinceMs) || '（无）'}\n\n`;
+    try {
+      c += `===== 本次容器日志（实时 tail 300） =====\n${(await instanceLogs(inst, 300)).trimEnd() || '（无）'}\n`;
+    } catch (e: any) {
+      c += `===== 本次容器日志 =====\n获取失败：${e?.message || e}\n`;
+    }
+    entries.push({ name: `instances/${inst.id}.log`, content: c });
+  }
+
+  // 全部 woc-* 容器清单（含未登记/残留，用于诊断"首次创建失败遗留"）
+  try {
+    const all = await docker.listContainers({ all: true });
+    const known = new Set(instances.map((i) => i.containerName));
+    let txt = '所有 woc-* 容器：\n\n';
+    for (const ct of all) {
+      const names = (ct.Names || []).map((n: string) => n.replace(/^\//, ''));
+      if (!names.some((n) => n.startsWith('woc-'))) continue;
+      const nm = names.join(',');
+      const tag = nm.includes('woc-panel') ? '面板' : known.has(nm) ? '已登记实例' : '未登记/残留';
+      txt += `[${tag}] ${nm} · ${ct.State}/${ct.Status} · ${ct.Image}\n`;
+    }
+    entries.push({ name: 'containers.txt', content: txt });
+  } catch (e: any) {
+    entries.push({ name: 'containers.txt', content: '获取失败：' + (e?.message || e) });
+  }
+
+  return buildTarGz(entries);
 }
 
 // 校验文件名为安全 basename（防路径穿越）。
@@ -565,6 +719,20 @@ export async function instanceLogs(inst: Instance, tail = 600): Promise<string> 
   return out || buf.toString('utf8'); // 兜底：TTY 模式非多路复用
 }
 
+// ---------- 持久化日志 ----------
+// 日志原语（appendInstanceLog / readInstanceLog / deleteInstanceLog / appendPanelLog 等）已抽到 logs.ts
+// （无 docker 依赖，避免循环）。这里只保留需要 docker 的快照能力。
+
+// 把"即将被删/重建"的容器最后日志快照进持久日志（否则随容器删除丢失）。
+export async function snapshotContainerLog(inst: Instance, reason: string): Promise<void> {
+  try {
+    const logs = (await instanceLogs(inst, 200)).trimEnd();
+    appendInstanceLog(inst.id, `──── ${reason} ────\n${logs}\n──── 上一容器日志快照结束 ────`);
+  } catch {
+    /* 容器可能已不可读，忽略 */
+  }
+}
+
 // 通过 xdotool 在实例容器内输入文字（绕过 VNC keysym 限制，解决中文 IME 吞字问题）。
 // 用 base64 传递文本避免 shell 转义问题，xclip 写入剪贴板后 xdotool 模拟 Ctrl+V 粘贴。
 export async function typeInInstance(inst: Instance, text: string): Promise<void> {
@@ -576,8 +744,26 @@ export async function typeInInstance(inst: Instance, text: string): Promise<void
     'export DISPLAY="${display:-:1}"',
     'command -v xclip >/dev/null 2>&1 || { echo "xclip not installed in instance image" >&2; exit 127; }',
     'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
-    `echo '${b64}' | base64 -d | xclip -selection clipboard -i`,
+    // xclip -i 会 daemon 化常驻持有剪贴板选区，并继承 exec 的 stdout/stderr；不重定向的话 docker exec
+    // 要等这俩 fd 关闭，实测每次卡 ~2s。重定向到 /dev/null 后台后，整条链路从 ~2.1s 降到 ~0.08s。
+    `echo '${b64}' | base64 -d | xclip -selection clipboard -i >/dev/null 2>&1`,
     'xdotool key --clearmodifiers ctrl+v',
+  ].join('; ');
+  await execCapture(inst, ['bash', '-c', cmd]);
+}
+
+// 通过 xdotool 在实例容器内模拟一次按键（如 Return / BackSpace）。
+// 用于「无感输入」模式：中文经 xclip 转发期间，把被截下的回车/退格按序送出，保证顺序、避免抢跑。
+// key 仅允许字母与下划线（xdotool keysym 名），杜绝注入。
+export async function keyInInstance(inst: Instance, key: string): Promise<void> {
+  if (!/^[A-Za-z_]{1,20}$/.test(key)) throw new Error('按键名不合法');
+  const cmd = [
+    'set -e',
+    'display="${DISPLAY:-}"',
+    'if [ -z "$display" ]; then for x in /tmp/.X11-unix/X*; do [ -e "$x" ] || continue; display=":${x##*X}"; break; done; fi',
+    'export DISPLAY="${display:-:1}"',
+    'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
+    `xdotool key --clearmodifiers ${key}`,
   ].join('; ');
   await execCapture(inst, ['bash', '-c', cmd]);
 }

@@ -26,8 +26,11 @@ import {
   createInstance,
   removeInstance as removeInstanceRecord,
   renameInstance,
+  setInstanceIcon,
   setInstanceUsers,
   publicInstance,
+  APP_TYPES,
+  type AppType,
   type User,
   type Instance,
 } from './store.js';
@@ -47,7 +50,9 @@ import {
   downloadFromInstance,
   deleteInstanceFile,
   instanceLogs,
+  buildDiagnostics,
   typeInInstance,
+  keyInInstance,
   listOrphanVolumes,
   removeVolume,
   listOrphanContainers,
@@ -67,6 +72,8 @@ import {
 } from './docker.js';
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
+import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
+import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -164,6 +171,19 @@ app.get('/api/auth/me', async (req, reply) => {
   const u = currentUser(req);
   if (!u) return reply.code(401).send({ error: '未登录' });
   return { user: publicUser(u) };
+});
+
+// ---------- 版本与更新检测 ----------
+// 当前构建版本 + 缓存的「最新版」检测结果（后台每 6h 查一次 Docker Hub/GHCR）。任何登录用户可读。
+app.get('/api/version', async (req, reply) => {
+  if (!requireAuth(req, reply)) return;
+  ensureChecked(); // 刚启动还没首检时，触发一次后台检查（不阻塞本次响应）
+  return versionInfo();
+});
+// 立即重新检查（管理员，用于「检查更新」按钮）。
+app.post('/api/admin/version/check', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  return await checkForUpdate();
 });
 
 // ---------- 自助改密 ----------
@@ -269,11 +289,12 @@ app.get('/api/instances', async (req, reply) => {
 app.post('/api/admin/instances', async (req, reply) => {
   const admin = requireAdmin(req, reply);
   if (!admin) return;
-  const { name, reuseVolume } = (req.body as any) ?? {};
+  const { name, reuseVolume, appType } = (req.body as any) ?? {};
   const allowedUserIds = Array.isArray((req.body as any)?.allowedUserIds) ? (req.body as any).allowedUserIds : [];
   if (!name || String(name).trim().length === 0 || String(name).length > 30) {
     return reply.code(400).send({ error: '实例名称为 1-30 个字符' });
   }
+  const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
   // 复用卷：必须以 woc-data- 开头，且不能被现存实例占用。后端先校验，避免坏名穿透到 docker run。
   let reuseVolumeName: string | undefined;
   if (reuseVolume) {
@@ -285,13 +306,20 @@ app.post('/api/admin/instances', async (req, reply) => {
     }
     reuseVolumeName = reuseVolume;
   }
-  const inst = createInstance(String(name), admin.id, allowedUserIds, reuseVolumeName);
+  const inst = createInstance(String(name), admin.id, allowedUserIds, reuseVolumeName, type);
+  appendPanelLog(
+    'INFO',
+    `创建实例「${inst.name}」(${type}, id=${inst.id}) by ${admin.username}${reuseVolumeName ? ` · 复用卷 ${reuseVolumeName}` : ''} → 开始创建容器（镜像缺失会自动拉取，首次较慢）`,
+  );
+  appendInstanceLog(inst.id, `实例创建（${type}）by ${admin.username}`);
   try {
     await runInstance(inst);
   } catch (e: any) {
     removeInstanceRecord(inst.id); // 容器起不来则回滚登记
+    appendPanelLog('ERROR', `创建实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     return reply.code(500).send({ error: '创建容器失败：' + (e?.message || e) });
   }
+  appendPanelLog('INFO', `创建实例「${inst.name}」(id=${inst.id}) 成功`);
   return { instance: publicInstance(inst) };
 });
 
@@ -428,6 +456,7 @@ app.delete('/api/admin/instances/:id', async (req, reply) => {
   const purge = (req.query as any)?.purge === '1' || (req.query as any)?.purge === 'true';
   const inst = findInstance(id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  appendPanelLog('INFO', `删除实例「${inst.name}」(id=${id})${purge ? ' · 同时清除数据卷' : ' · 保留数据卷'}`);
   await removeInstanceContainer(inst, purge);
   removeInstanceRecord(id);
   controlHolders.delete(id);
@@ -445,6 +474,17 @@ app.post('/api/admin/instances/:id/rename', async (req, reply) => {
   }
 });
 
+// 设置实例自定义图标（仅管理员）：icon = builtin:<key> / data:image 图片 / 空串(恢复默认)。
+app.post('/api/admin/instances/:id/icon', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const { icon } = (req.body as any) ?? {};
+  try {
+    return { instance: setInstanceIcon((req.params as any).id, typeof icon === 'string' ? icon : null) };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '设置图标失败' });
+  }
+});
+
 // 启动实例容器（仅管理员）：容器停止或被删后，一键拉起（不重建数据卷）。
 app.post('/api/admin/instances/:id/start', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
@@ -452,8 +492,10 @@ app.post('/api/admin/instances/:id/start', async (req, reply) => {
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
     await ensureRunning(inst);
+    appendPanelLog('INFO', `启动实例「${inst.name}」(id=${inst.id})`);
     return { ok: true };
   } catch (e: any) {
+    appendPanelLog('ERROR', `启动实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     return reply.code(500).send({ error: '启动失败：' + (e?.message || e) });
   }
 });
@@ -465,8 +507,10 @@ app.post('/api/admin/instances/:id/stop', async (req, reply) => {
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
     await stopInstance(inst);
+    appendPanelLog('INFO', `停止实例「${inst.name}」(id=${inst.id})`);
     return { ok: true };
   } catch (e: any) {
+    appendPanelLog('ERROR', `停止实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     return reply.code(500).send({ error: '停止失败：' + (e?.message || e) });
   }
 });
@@ -477,9 +521,11 @@ app.post('/api/admin/instances/:id/restart', async (req, reply) => {
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
+    appendPanelLog('INFO', `重启实例「${inst.name}」(id=${inst.id})`);
     await runInstance(inst);
     return { ok: true };
   } catch (e: any) {
+    appendPanelLog('ERROR', `重启实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     return reply.code(500).send({ error: '重启失败：' + (e?.message || e) });
   }
 });
@@ -491,9 +537,12 @@ app.post('/api/admin/instances/:id/upgrade', async (req, reply) => {
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
+    appendPanelLog('INFO', `升级实例「${inst.name}」(id=${inst.id})：拉取最新镜像后重建`);
     await upgradeInstance(inst);
+    appendPanelLog('INFO', `升级实例「${inst.name}」(id=${inst.id}) 完成`);
     return { ok: true };
   } catch (e: any) {
+    appendPanelLog('ERROR', `升级实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     return reply.code(500).send({ error: '升级失败：' + (e?.message || e) });
   }
 });
@@ -632,18 +681,71 @@ app.post('/api/instances/:id/type', async (req, reply) => {
   }
 });
 
+// 模拟单个按键（无感输入模式下按序送出被截下的回车/退格，保证与中文转发的顺序）
+app.post('/api/instances/:id/key', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  const { key } = (req.body as any) ?? {};
+  if (!key || typeof key !== 'string') return reply.code(400).send({ error: '按键名为空' });
+  try {
+    await keyInInstance(findInstance(id)!, key);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message || '按键失败' });
+  }
+});
+
 // 查看实例容器日志（仅管理员）：排查"无法进入/未安装/卡死"等。inline 文本，浏览器可直接看/另存。
 app.get('/api/admin/instances/:id/logs', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  reply.header('content-type', 'text/plain; charset=utf-8');
+  // 持久化历史（重启原因 + 上一容器日志快照，跨重建保留）+ 本次容器实时日志。
+  const history = readInstanceLog(inst.id).trimEnd();
+  let live = '';
   try {
-    const text = await instanceLogs(inst);
-    reply.header('content-type', 'text/plain; charset=utf-8');
-    return reply.send(text || '（暂无日志）');
+    live = (await instanceLogs(inst)).trimEnd();
   } catch (e: any) {
-    reply.header('content-type', 'text/plain; charset=utf-8');
-    return reply.send('获取日志失败：' + (e?.message || e));
+    live = '获取本次容器日志失败：' + (e?.message || e);
+  }
+  if (!history && !live) return reply.send('（暂无日志）');
+  if (!history) return reply.send(live);
+  return reply.send(
+    `═══ 历史日志（持久化 · 跨重启保留）═══\n${history}\n\n═══ 本次容器日志（实时）═══\n${live || '（本次容器暂无日志）'}`,
+  );
+});
+
+// ---------- 全局日志 / 诊断包（仅管理员）----------
+// 面板全局运维日志（创建/删除/升级/启停/镜像拉取/错误等跨实例事件），可按时间范围裁剪。
+app.get('/api/admin/panel-log', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  reply.header('content-type', 'text/plain; charset=utf-8');
+  const since = Date.now() - rangeToMs((req.query as any)?.range);
+  const text = filterSince(readPanelLog(), since).trimEnd();
+  return reply.send(text || '（暂无面板日志）');
+});
+
+// 一键导出诊断包（tar.gz）：系统信息 + 面板日志 + 各实例容器状态/持久日志/实时日志 + 全部容器清单。
+// 单实例日志只记录"实例内单次日志"，这里把全局 + 全部实例 + 容器层面的信息打包，便于排查
+// 首个实例创建卡死 / 打开实例黑屏不可用 / 升级失败等问题。range：24h（默认）/7d/30d/1y。
+app.get('/api/admin/diagnostics', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const range = ((req.query as any)?.range as string) || '24h';
+  if (!DIAG_RANGES[range]) return reply.code(400).send({ error: '时间范围非法（24h/7d/30d/1y）' });
+  const since = Date.now() - rangeToMs(range);
+  try {
+    const buf = await buildDiagnostics(listInstances(), since, { range, 面板版本: CURRENT_VERSION });
+    const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+    reply.header('content-type', 'application/gzip');
+    reply.header('content-disposition', `attachment; filename="woc-diag-${range}-${stamp}.tar.gz"`);
+    appendPanelLog('INFO', `导出诊断包（范围 ${range}，${buf.length} 字节）`);
+    return reply.send(buf);
+  } catch (e: any) {
+    appendPanelLog('ERROR', `导出诊断包失败：${e?.message || e}`);
+    return reply.code(500).send({ error: '生成诊断包失败：' + (e?.message || e) });
   }
 });
 
@@ -800,8 +902,10 @@ async function triggerInstanceWechat(id: string, cmd: 'install' | 'update', repl
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
     await triggerWechat(inst, cmd);
+    appendPanelLog('INFO', `实例「${inst.name}」(id=${id}) 触发${cmd === 'install' ? '下载安装' : '更新'}应用`);
     return { ok: true };
   } catch (e: any) {
+    appendPanelLog('ERROR', `实例「${inst.name}」(id=${id}) 触发${cmd === 'install' ? '安装' : '更新'}失败：${e?.message || e}`);
     return reply.code(500).send({ error: '无法触发安装：' + (e?.message || e) });
   }
 }
@@ -947,12 +1051,16 @@ for (const pub of listInstances()) {
 //   WOC_INSTANCE_MEM_SOFT_MB    soft 阈值；默认 1500
 //   WOC_INSTANCE_MEM_HARD_MB    hard 阈值；默认 2500（也兼容旧名 WOC_INSTANCE_MEM_LIMIT_MB）
 //   WOC_WATCHDOG_INTERVAL_SEC   巡检间隔秒；默认 300（5 分钟），最小 60；0 关闭整个 watchdog
+//   WOC_WATCHDOG_HEALTH_FAILS   VNC 响应性探测：连续无响应几次才重启；默认 0=关闭该探测（仅保留内存自愈）
 const DEFAULT_SOFT_MB = Math.max(0, Number(process.env.WOC_INSTANCE_MEM_SOFT_MB ?? 1500));
 const DEFAULT_HARD_MB = Math.max(
   0,
   Number(process.env.WOC_INSTANCE_MEM_HARD_MB ?? process.env.WOC_INSTANCE_MEM_LIMIT_MB ?? 2500),
 );
 const WATCHDOG_INTERVAL_SEC = Math.max(60, Number(process.env.WOC_WATCHDOG_INTERVAL_SEC ?? 300));
+// VNC 响应性探测默认关闭（=0）。实测健康实例 ~1ms 响应，但偶发宿主级 CPU/IO 争用（如同机重 docker build）
+// 会让探测超时被误判为 stall 而重启正常实例，故默认不启用；需要时设为正整数 N（连续 N 次无响应才重启）开启。
+const HEALTH_FAIL_LIMIT = Math.max(0, Number(process.env.WOC_WATCHDOG_HEALTH_FAILS ?? 0));
 const WATCHDOG_ENABLED = WATCHDOG_INTERVAL_SEC > 0 && (DEFAULT_SOFT_MB > 0 || DEFAULT_HARD_MB > 0);
 
 // 单实例生效阈值：per-instance 覆盖优先；为 undefined 则用 env 默认。
@@ -973,18 +1081,20 @@ function hasActiveSession(id: string): boolean {
 
 if (WATCHDOG_ENABLED) {
   const recovering = new Set<string>(); // 防重入：自愈期间跳过本实例
-  const healthFails = new Map<string, number>(); // id → 连续无响应次数
-  const HEALTH_FAIL_LIMIT = 2; // 连续 N 次无响应才重启，避免误杀刚启动/瞬时抖动
+  const healthFails = new Map<string, number>(); // id → 连续无响应次数（仅 HEALTH_FAIL_LIMIT>0 时启用）
 
   const recover = async (inst: Instance, reason: string, detail: string) => {
     recovering.add(inst.id);
     app.log.warn(`[watchdog] ${inst.containerName} ${detail}`);
+    appendInstanceLog(inst.id, `[看门狗] 自愈重启（${reason}）：${detail}`);
+    appendPanelLog('WARN', `[看门狗] 实例「${inst.name}」(id=${inst.id}) 自愈重启（${reason}）：${detail}`);
     try {
       await stopInstance(inst);
       await runInstance(inst);
       healthFails.delete(inst.id);
       app.log.info(`[watchdog] ${inst.containerName} 自愈完成（${reason}）`);
     } catch (e: any) {
+      appendPanelLog('ERROR', `[看门狗] 实例「${inst.name}」(id=${inst.id}) 自愈失败（${reason}）：${e?.message || e}`);
       app.log.error(`[watchdog] ${inst.containerName} 自愈失败（${reason}）: ${e?.message || e}`);
     } finally {
       recovering.delete(inst.id);
@@ -1017,18 +1127,21 @@ if (WATCHDOG_ENABLED) {
             app.log.info(`[watchdog] ${inst.containerName} mem=${mb}MiB ≥ soft=${soft}MiB 但用户在使用，延后`);
           }
         }
-        // 2) 响应性自愈（新）：探测 VNC 是否还能提供页面；连续 N 次无响应 → 重启
+        // 2) 响应性自愈：探测 VNC 是否还能提供页面；连续 N 次无响应 → 重启。
         //    应对"进程没死、显示在线，但 I/O/服务 stall 读不出 VNC 文件、永远卡在正在连接桌面"。
-        const healthy = await instanceHttpHealthy(inst);
-        if (healthy) {
-          healthFails.delete(inst.id);
-          continue;
-        }
-        const fails = (healthFails.get(inst.id) || 0) + 1;
-        healthFails.set(inst.id, fails);
-        app.log.warn(`[watchdog] ${inst.containerName} VNC 无响应（连续 ${fails}/${HEALTH_FAIL_LIMIT}）`);
-        if (fails >= HEALTH_FAIL_LIMIT) {
-          await recover(inst, 'unresponsive', `VNC 连续 ${fails} 次无响应（疑似 I/O/服务 stall），自愈重启`);
+        //    默认关闭（HEALTH_FAIL_LIMIT=0）：偶发宿主级争用会误判健康实例为 stall；需要时用 env 开启。
+        if (HEALTH_FAIL_LIMIT > 0) {
+          const healthy = await instanceHttpHealthy(inst);
+          if (healthy) {
+            healthFails.delete(inst.id);
+            continue;
+          }
+          const fails = (healthFails.get(inst.id) || 0) + 1;
+          healthFails.set(inst.id, fails);
+          app.log.warn(`[watchdog] ${inst.containerName} VNC 无响应（连续 ${fails}/${HEALTH_FAIL_LIMIT}）`);
+          if (fails >= HEALTH_FAIL_LIMIT) {
+            await recover(inst, 'unresponsive', `VNC 连续 ${fails} 次无响应（疑似 I/O/服务 stall），自愈重启`);
+          }
         }
       } catch (e: any) {
         app.log.warn(`[watchdog] ${pub.id} 检查异常: ${e?.message || e}`);
@@ -1037,9 +1150,14 @@ if (WATCHDOG_ENABLED) {
   };
   setInterval(() => void tick(), WATCHDOG_INTERVAL_SEC * 1000).unref();
   console.log(
-    `[watchdog] 已启用 · soft=${DEFAULT_SOFT_MB} MiB · hard=${DEFAULT_HARD_MB} MiB · 间隔=${WATCHDOG_INTERVAL_SEC}s · 含响应性探测`,
+    `[watchdog] 已启用 · soft=${DEFAULT_SOFT_MB} MiB · hard=${DEFAULT_HARD_MB} MiB · 间隔=${WATCHDOG_INTERVAL_SEC}s · VNC响应性探测=${HEALTH_FAIL_LIMIT > 0 ? `连续${HEALTH_FAIL_LIMIT}次` : '关闭'}`,
   );
 }
 
 await app.listen({ port: PORT, host: HOST });
-console.log(`[panel] 监听 http://${HOST}:${PORT}  （多实例反代已就绪）`);
+console.log(`[panel] 监听 http://${HOST}:${PORT}  （多实例反代已就绪）· 版本 ${CURRENT_VERSION}`);
+appendPanelLog('INFO', `面板启动 · 版本 ${CURRENT_VERSION} · 监听 ${HOST}:${PORT}`);
+startUpdateChecker(); // 后台检测新版（best-effort，失败静默）
+// 日志保留期清理：启动后跑一次 + 每 24h 一次，删除超过一年的日志行（unref 不阻止退出）。
+pruneOldLogs();
+setInterval(() => pruneOldLogs(), 24 * 60 * 60 * 1000).unref();

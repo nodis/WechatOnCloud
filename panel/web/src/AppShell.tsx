@@ -2,7 +2,8 @@ import { createContext, useContext, useEffect, useRef, useState, type ReactNode 
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from './auth';
 import { useUI, PasswordInput } from './ui';
-import { api, type InstanceWithStatus } from './api';
+import { api, appProfile, type InstanceWithStatus } from './api';
+import { InstanceIcon } from './AppIcon';
 import InstanceView from './pages/Desktop';
 import Admin from './pages/Admin';
 
@@ -156,6 +157,17 @@ function Sidebar({ collapsed, onToggleCollapsed }: { collapsed: boolean; onToggl
   const isAdmin = user?.role === 'admin';
   const go = (p: string) => nav(p);
 
+  // 有新版时在「管理」入口点个红点（仅管理员，因为升级面板需管理员在宿主操作）。
+  // 依赖 loc.pathname：导航时复查一次（服务端有缓存、开销极小），保证刚启动时首检完成后红点能及时出现。
+  const [hasUpdate, setHasUpdate] = useState(false);
+  useEffect(() => {
+    if (!isAdmin) return;
+    api
+      .getVersion()
+      .then((v) => setHasUpdate(!!v.hasUpdate))
+      .catch(() => {});
+  }, [isAdmin, loc.pathname]);
+
   return (
     <aside className="sidebar">
       <div className="sb-top">
@@ -175,7 +187,7 @@ function Sidebar({ collapsed, onToggleCollapsed }: { collapsed: boolean; onToggl
         </button>
       </nav>
 
-      {!collapsed && <div className="sb-section">微信实例</div>}
+      {!collapsed && <div className="sb-section">实例</div>}
       <div className="sb-list">
         {instances.length === 0 && !collapsed && <div className="sb-empty">暂无可用实例</div>}
         {instances.map((inst) => {
@@ -184,7 +196,7 @@ function Sidebar({ collapsed, onToggleCollapsed }: { collapsed: boolean; onToggl
           return (
             <button key={inst.id} className={'sb-item sb-inst' + (on ? ' on' : '')} onClick={() => go(`/i/${inst.id}`)} title={inst.name}>
               <span className="sb-avatar">
-                {inst.name.slice(0, 1)}
+                <InstanceIcon icon={inst.icon} appType={inst.appType} size={34} radius={10} />
                 <span className={'sb-dot ' + st.cls} />
               </span>
               {!collapsed && <span className="sb-label">{inst.name}</span>}
@@ -195,9 +207,17 @@ function Sidebar({ collapsed, onToggleCollapsed }: { collapsed: boolean; onToggl
       </div>
 
       <div className="sb-footer">
-        <button className={'sb-item' + (loc.pathname === '/admin' ? ' on' : '')} onClick={() => go('/admin')} title={isAdmin ? '管理' : '设置'}>
-          <span className="sb-ic">{Icon.gear}</span>
+        <button
+          className={'sb-item' + (loc.pathname === '/admin' ? ' on' : '')}
+          onClick={() => go('/admin')}
+          title={isAdmin && hasUpdate ? '管理 · 有新版本可用' : isAdmin ? '管理' : '设置'}
+        >
+          <span className="sb-ic">
+            {Icon.gear}
+            {isAdmin && hasUpdate && <span className="sb-updot" />}
+          </span>
           {!collapsed && <span className="sb-label">{isAdmin ? '管理' : '设置'}</span>}
+          {!collapsed && isAdmin && hasUpdate && <span className="sb-updot-text">新版</span>}
         </button>
         <button
           className="sb-item"
@@ -252,7 +272,7 @@ function HomeView({ onOpenMenu, onChangePassword }: { onOpenMenu: () => void; on
         )}
 
         <div className="section-row">
-          <span className="section-title">我的微信实例</span>
+          <span className="section-title">我的实例</span>
           {isAdmin && (
             <button className="btn-text" onClick={() => nav('/admin')}>
               管理 ›
@@ -265,21 +285,24 @@ function HomeView({ onOpenMenu, onChangePassword }: { onOpenMenu: () => void; on
             <div className="empty-blob">
               <img src="/favicon.svg" alt="" />
             </div>
-            <div className="empty-title">还没有微信实例</div>
-            <div className="empty-sub">{isAdmin ? '去「管理」新建一个微信实例' : '请联系管理员为你分配实例'}</div>
+            <div className="empty-title">还没有实例</div>
+            <div className="empty-sub">{isAdmin ? '去「管理」新建一个实例' : '请联系管理员为你分配实例'}</div>
           </div>
         ) : (
           <div className="inst-grid">
             {instances.map((inst) => {
               const st = statusOf(inst);
+              const prof = appProfile(inst.appType);
               const meta = inst.wechat.installed
-                ? `微信 ${inst.wechat.version || ''}`.trim()
-                : inst.runtime === 'running'
-                  ? '待下载安装微信'
+                ? `${prof.label} ${inst.wechat.version || ''}`.trim()
+                : inst.runtime === 'running' && prof.needsInstall
+                  ? `待下载安装${prof.label}`
                   : '';
               return (
                 <button key={inst.id} className="home-card" onClick={() => nav(`/i/${inst.id}`)}>
-                  <span className="home-card-av">{inst.name.slice(0, 1)}</span>
+                  <span className="home-card-av">
+                    <InstanceIcon icon={inst.icon} appType={inst.appType} size={42} radius={12} />
+                  </span>
                   <span className="home-card-main">
                     <span className="home-card-name">{inst.name}</span>
                     <span className="home-card-meta">

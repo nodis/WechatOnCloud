@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api } from '../api';
+import { api, appProfile } from '../api';
 import { useUI } from '../ui';
 import { useAuth } from '../auth';
 import { useInstances } from '../AppShell';
@@ -12,6 +12,76 @@ function desktopUrl(id: string) {
     `/desktop/${id}/vnc/index.html?autoconnect=1&path=desktop/${id}/websockify&resize=remote` +
     '&reconnect=true&reconnect_delay=2000&clipboard_up=true&clipboard_down=true&clipboard_seamless=true'
   );
+}
+
+// 「无感输入」钩子：装进同源 iframe，让用户直接在微信里打中文。
+// - compositionend（中文提交）→ 经 xclip+xdotool 转发（绕开 VNC keysym 容量上限）。
+// - 转发未完成期间（队列活跃），把后续可见字符 + 回车/退格也串进同一队列按序送出 →
+//   彻底消除"中文走异步、数字走 keysym 抢跑"导致的"你好123→23"丢字。
+// - 队列空闲时不干预：英文/数字仍走原生 keysym，零延迟。
+// 返回清理函数（切回转发模式 / 重连 / 卸载时移除监听）。
+function installSeamlessIme(win: Window, doc: Document, instId: string): () => void {
+  type Job = { kind: 'text'; data: string } | { kind: 'key'; data: string };
+  const queue: Job[] = [];
+  let draining = false;
+  const active = () => draining || queue.length > 0;
+
+  const drain = async () => {
+    if (draining) return;
+    draining = true;
+    while (queue.length) {
+      const job = queue[0];
+      try {
+        if (job.kind === 'text') await api.typeInInstance(instId, job.data);
+        else await api.keyInInstance(instId, job.data);
+      } catch {
+        /* 单条失败丢弃，继续后续，避免卡住队列 */
+      }
+      queue.shift();
+    }
+    draining = false;
+  };
+
+  const onCompositionEnd = (e: Event) => {
+    const txt = (e as CompositionEvent).data;
+    if (!txt) return;
+    queue.push({ kind: 'text', data: txt });
+    drain();
+  };
+
+  // 捕获阶段（iframe window 最外层）抢先拦截，赶在 noVNC 之前 → stopImmediatePropagation 阻止它发 keysym。
+  // 关键：队列活跃（有中文正在转发）时，只接管【数字】和回车/退格——它们不参与拼音合成、且是原"混数字丢字"的祸首；
+  // 字母绝不接管，否则会把下一个词的拼音首字母（如"呀"的 y）当成字面字符抢走，造成"你好y呀"。字母交给输入法合成。
+  const onKeyDownCapture = (ev: Event) => {
+    const e = ev as KeyboardEvent;
+    if (e.isComposing) return; // 拼音合成中，交给输入法（候选数字选词也在此放行）
+    if (e.ctrlKey || e.altKey || e.metaKey) return; // 快捷键放行
+    if (!active()) return; // 没有中文在转发 → 不接管（英文/数字走原生 keysym，零延迟）
+    if (/^[0-9]$/.test(e.key)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      queue.push({ kind: 'text', data: e.key });
+      drain();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      queue.push({ kind: 'key', data: 'Return' });
+      drain();
+    } else if (e.key === 'Backspace') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      queue.push({ kind: 'key', data: 'BackSpace' });
+      drain();
+    }
+    // 其它非可见键（方向键/功能键等）放行
+  };
+
+  doc.addEventListener('compositionend', onCompositionEnd, true);
+  win.addEventListener('keydown', onKeyDownCapture, true);
+  return () => {
+    doc.removeEventListener('compositionend', onCompositionEnd, true);
+    win.removeEventListener('keydown', onKeyDownCapture, true);
+  };
 }
 
 interface TFile {
@@ -46,8 +116,27 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const [files, setFiles] = useState<TFile[]>([]);
   const [showClip, setShowClip] = useState(false);
   const [clipText, setClipText] = useState('');
-  // 中文输入条：面板里的真实 textarea（原生客户端输入法 100% 可用），回车经 xclip+xdotool 粘进微信。
-  const [imeBar, setImeBar] = useState(true); // 默认开（直接在 VNC 里打中文不稳，给一个可靠通道）
+  // 中文输入模式：'forward'=底部输入条转发（默认，最稳）；'seamless'=无感（直接在微信里打，提交后转发）。
+  const [inputMode, setInputMode] = useState<'forward' | 'seamless'>(() => {
+    try {
+      return window.localStorage.getItem('woc_input_mode') === 'seamless' ? 'seamless' : 'forward';
+    } catch {
+      return 'forward';
+    }
+  });
+  const setMode = (m: 'forward' | 'seamless') => {
+    try {
+      window.localStorage.setItem('woc_input_mode', m);
+      // 同步写好 enable_ime，重载后新页面的 noVNC 连接时即读到
+      window.localStorage.setItem('enable_ime', m === 'seamless' ? 'true' : 'false');
+    } catch {
+      /* 隐私模式禁用 localStorage：忽略 */
+    }
+    // 整页重载切换：先卸载旧页面（彻底关闭旧 VNC ws），再以新 enable_ime 干净重连。
+    // 不能用页内 bump vncNonce 重挂 iframe——那会让新旧两条 ws 短暂并存，概率性把实例的 Xvnc 卡死
+    //（需重启容器才恢复、面板重启无效），且新连接常读不到新模式（仍是英文）。整页重载是实测唯一可靠的方式。
+    window.location.reload();
+  };
   const [imeText, setImeText] = useState('');
   const [imeSending, setImeSending] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -61,6 +150,8 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const audioRef = useRef<VncAudio | null>(null);
 
   const inst = instances.find((i) => i.id === id);
+  const profile = appProfile(inst?.appType); // 按应用类型显示正确文案（微信/Chromium…）
+  const appLabel = profile.label;
   // 进入实例时，共享列表可能尚未同步（管理页新建/安装后），先按"探测中"显示加载态，
   // 等列表刷新到该实例或超时后再判定是否真的不存在，避免从管理页跳转时误报"实例不存在"。
   const [probing, setProbing] = useState(true);
@@ -203,18 +294,27 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     };
   }, [showVnc, id, frameLoaded]);
 
-  // 每次进入/重连桌面前，强制把 KasmVNC 的 enable_ime 设为【关】。
-  // 原因：开启 IME 模式后，noVNC 用隐藏 textarea + 合成事件还原中文，需要前端拦截/差分，环环相扣极脆，
-  // 实测会"中文混数字时丢最后两个汉字+首个数字"等损坏。中文输入改由底部「中文输入条」可靠承担
-  // （面板真实 textarea 原生输入法 → xclip+xdotool 粘贴），故 VNC 直接打字回归纯 keysym：英文/数字/
-  // 标点都正常、不再损坏；中文直接打不进（请用输入条）。iframe 同源共享 localStorage，加载前设好即生效。
+  // 进入/重连桌面前，按输入模式设 KasmVNC 的 enable_ime（iframe 同源共享 localStorage，加载前设好即生效）。
+  //   无感（seamless）：enable_ime=true，启用 noVNC 合成 textarea；中文 keysym 已被容器补丁抑制，
+  //     成品由「无感输入」钩子经 xdotool 转发（见 installSeamlessIme）。
+  //   转发（forward）：enable_ime=false，VNC 直接打字纯 keysym（英文/数字正常）；中文走底部输入条。
   useEffect(() => {
     try {
-      window.localStorage.setItem('enable_ime', 'false');
+      window.localStorage.setItem('enable_ime', inputMode === 'seamless' ? 'true' : 'false');
     } catch {
       /* 隐私模式等禁用 localStorage：忽略 */
     }
-  }, [id, vncNonce]);
+  }, [id, vncNonce, inputMode]);
+
+  // 无感模式：往同源 iframe 装「中文转发 + 有序队列」钩子；切回转发/重连/卸载时自动移除。
+  useEffect(() => {
+    if (inputMode !== 'seamless' || !showVnc || !frameLoaded || !id) return;
+    const win = frameRef.current?.contentWindow;
+    const doc = frameRef.current?.contentDocument;
+    if (!win || !doc) return;
+    const cleanup = installSeamlessIme(win, doc, id);
+    return cleanup;
+  }, [inputMode, showVnc, frameLoaded, id, vncNonce]);
 
   // 音频/麦克风桥接：实例就绪即自动连接 kclient 的音频流（扬声器恒开，无需手动找工具条）；
   // 仅当本实例处于焦点（标签页可见且窗口聚焦）时出声/收音，失焦立即断开，避免多实例多端串音。
@@ -268,7 +368,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
     setUploading(false);
     if (ok) {
-      toast(`已上传 ${ok} 个文件到桌面，微信里可直接选取`, 'ok');
+      toast(`已上传 ${ok} 个文件到桌面，应用里可直接取用`, 'ok');
       refreshFiles();
     }
   };
@@ -281,7 +381,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   };
 
   const delFile = async (name: string) => {
-    if (!(await confirm({ title: `删除「${name}」？`, body: '将从微信桌面（~/Desktop）移除该文件。', danger: true, confirmText: '删除' }))) return;
+    if (!(await confirm({ title: `删除「${name}」？`, body: '将从桌面（~/Desktop）移除该文件。', danger: true, confirmText: '删除' }))) return;
     try {
       await api.deleteFile(id, name);
       toast('已删除', 'ok');
@@ -347,7 +447,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       return;
     }
     if (pushClipboardToRemote(t)) {
-      toast('已发送到容器剪贴板，请在微信输入框按 Ctrl+V 粘贴', 'ok');
+      toast('已发送到容器剪贴板，请在应用输入框按 Ctrl+V 粘贴', 'ok');
     } else {
       toast('发送失败：桌面尚未连接', 'error');
     }
@@ -388,7 +488,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const restartInstance = async () => {
     const ok = await confirm({
       title: '重启该实例？',
-      body: '会重建容器（聊天记录保留），微信重新启动，约十几秒；用于修复卡死/最小化丢失等。',
+      body: `会重建容器（数据保留），${appLabel}重新启动，约十几秒；用于修复卡死/最小化丢失等。`,
       confirmText: '重启',
     });
     if (!ok) return;
@@ -427,7 +527,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   };
 
-  const title = inst?.name || '微信实例';
+  const title = inst?.name || '实例';
 
   return (
     <div className="ws-page">
@@ -449,11 +549,15 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               文件
             </button>
             <button
-              className={'ws-action' + (imeBar ? ' on' : '')}
-              title="底部中文输入条：用本机输入法打中文，回车送进微信（最可靠）"
-              onClick={() => setImeBar((v) => !v)}
+              className={'ws-action' + (inputMode === 'seamless' ? ' on' : '')}
+              title={
+                inputMode === 'seamless'
+                  ? '无感输入：直接在应用输入框里打中文（提交后转发，已修复混数字丢字）。点击切回「转发输入条」'
+                  : '转发输入：用底部输入条打中文，最稳。点击切到「无感输入」（直接在应用里打）'
+              }
+              onClick={() => setMode(inputMode === 'seamless' ? 'forward' : 'seamless')}
             >
-              中文输入
+              输入：{inputMode === 'seamless' ? '无感' : '转发'}
             </button>
             <button
               className="ws-action"
@@ -507,7 +611,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
         <div className="iv-stage iv-center">
           <div className="iv-notice">
             <div className="spinner" />
-            <div className="iv-notice-title">微信安装中…</div>
+            <div className="iv-notice-title">{appLabel}安装中…</div>
             <div className="iv-notice-sub">
               {inst.wechat.message || '请稍候'}
               {inst.wechat.percent >= 0 ? ` · ${inst.wechat.percent}%` : ''} ——完成后自动进入，无需刷新
@@ -517,18 +621,18 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       ) : !installed ? (
         <div className="iv-stage iv-center">
           <div className="iv-notice">
-            <div className="iv-notice-title">{inst.wechat.phase === 'error' ? '微信安装出错' : '微信尚未安装'}</div>
+            <div className="iv-notice-title">{inst.wechat.phase === 'error' ? `${appLabel}安装出错` : `${appLabel}尚未安装`}</div>
             <div className="iv-notice-sub">
               {inst.wechat.phase === 'error'
                 ? inst.wechat.message || '安装失败，可在「管理」重试'
-                : '该实例容器已就绪，但尚未安装微信'}
+                : `该实例容器已就绪，但尚未安装${appLabel}`}
             </div>
             {isAdmin ? (
               <button className="btn btn-primary iv-notice-btn" onClick={() => nav('/admin')}>
                 去「管理」{inst.wechat.phase === 'error' ? '重试 / 更新' : '下载安装'}
               </button>
             ) : (
-              <div className="iv-notice-sub">请联系管理员在「管理」中下载安装微信</div>
+              <div className="iv-notice-sub">请联系管理员在「管理」中下载安装{appLabel}</div>
             )}
             {isAdmin && (
               <button className="btn-text" onClick={() => window.open(api.instanceLogsUrl(id), '_blank')}>
@@ -545,15 +649,15 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
             ref={frameRef}
             className="iv-frame"
             src={desktopUrl(id)}
-            title="电脑版微信"
+            title={`${appLabel} · 实例桌面`}
             allow="clipboard-read; clipboard-write; microphone; camera; autoplay"
             onLoad={() => {
               setFrameLoaded(true);
               setTimeout(() => {
                 focusFrame(); // 加载完把键盘焦点交给 VNC
                 injectVncStyle(); // 让原生控制条在深色背景下可见
-                // 注意：不再调用 patchVncIme —— enable_ime 已关，直接打字走纯 keysym（英文/数字正常）；
-                // 中文由底部「中文输入条」承担。那套合成拦截既脆弱又会损坏混合输入，已弃用。
+                // 无感输入模式的键盘钩子由单独的 effect（依赖 inputMode/frameLoaded）安装，不在此处；
+                // 转发模式则 enable_ime=false，直接打字走纯 keysym（英文/数字正常），中文用底部输入条。
               }, 500);
             }}
           />
@@ -562,7 +666,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
             <div className="iv-loading">
               <div className="spinner" />
               <div className="iv-loading-text">正在连接桌面…</div>
-              <div className="iv-loading-sub">首次进入请扫码登录微信</div>
+              <div className="iv-loading-sub">{profile.enterHint}</div>
               <div className="iv-loading-sub">拖文件到此处即可上传；声音自动开启，点一下画面即可出声</div>
               {!window.isSecureContext && (
                 <div className="iv-loading-warn">当前非 HTTPS 访问，浏览器将禁用麦克风与摄像头（音频播放不受影响）</div>
@@ -601,8 +705,8 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
             <div className="iv-drop" onDrop={onDrop} onDragOver={(e) => e.preventDefault()}>
               <div className="drop-card">
                 <div className="drop-icon">⬇</div>
-                <div className="drop-title">松开上传到微信桌面</div>
-                <div className="drop-sub">上传后在微信里「+ / 文件」选择即可</div>
+                <div className="drop-title">松开上传到桌面</div>
+                <div className="drop-sub">上传后在应用里「+ / 文件」选择即可</div>
               </div>
             </div>
           )}
@@ -640,7 +744,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               <button className="btn btn-primary files-upload" disabled={uploading} onClick={() => fileInput.current?.click()}>
                 {uploading ? '上传中…' : '＋ 选择文件上传'}
               </button>
-              <div className="files-hint">也可直接把文件拖进来。下方为桌面（~/Desktop）里的文件，微信收到的文件另存到桌面即可在此下载。</div>
+              <div className="files-hint">也可直接把文件拖进来。下方为桌面（~/Desktop）里的文件，应用收到的文件另存到桌面即可在此下载。</div>
               <div className="files-list">
                 {files.length === 0 && (
                   <div className="muted small" style={{ padding: '10px 2px' }}>
@@ -674,23 +778,23 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                 className="clip-area"
                 value={clipText}
                 onChange={(e) => setClipText(e.target.value)}
-                placeholder="在此输入或粘贴文本，点「发送到微信」后到微信输入框按 Ctrl+V 粘贴"
+                placeholder="在此输入或粘贴文本，点「发送到剪贴板」后到应用输入框按 Ctrl+V 粘贴"
                 rows={5}
               />
               <button className="btn btn-primary files-upload" onClick={sendClip}>
-                发送到微信（容器剪贴板）
+                发送到剪贴板
               </button>
               <button className="btn-text" style={{ alignSelf: 'flex-start', marginTop: 6 }} onClick={pullClipboardFromRemote}>
                 ↓ 读取容器剪贴板到此框
               </button>
               <div className="files-hint">
-                局域网 http 访问时浏览器会禁用系统级剪贴板同步，故用此框中转：文本→容器剪贴板，再在微信里 Ctrl+V。
+                局域网 http 访问时浏览器会禁用系统级剪贴板同步，故用此框中转：文本→容器剪贴板，再在应用里 Ctrl+V。
               </div>
             </div>
           )}
           </div>
 
-          {imeBar && (
+          {inputMode === 'forward' && (
             <div className="iv-imebar">
               <textarea
                 className="iv-imebar-input"
@@ -702,7 +806,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                     sendImeText();
                   }
                 }}
-                placeholder="中文输入这里 → 回车送进微信（先点好微信的输入框）。Shift+回车换行。"
+                placeholder="中文输入这里 → 回车送进应用（先点好应用的输入框）。Shift+回车换行。"
                 rows={1}
               />
               <button
