@@ -133,16 +133,53 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       /* 隐私模式禁用 localStorage：忽略 */
     }
     // 整页重载切换：先卸载旧页面（彻底关闭旧 VNC ws），再以新 enable_ime 干净重连。
-    // 不能用页内 bump vncNonce 重挂 iframe——那会让新旧两条 ws 短暂并存，概率性把实例的 Xvnc 卡死
-    //（需重启容器才恢复、面板重启无效），且新连接常读不到新模式（仍是英文）。整页重载是实测唯一可靠的方式。
+    // 不能在页内重挂 iframe 重连——新旧两条 ws 短暂并存会概率性把实例的 Xvnc 卡死（需重启容器才恢复、
+    // 面板重启无效），且新连接常读不到新模式（仍是英文）。整页重载是实测唯一可靠的方式；
+    // 「重新连接」按钮与「重启实例」后的重连同样走整页重载（见 restartInstance / 桌面无响应面板）。
     window.location.reload();
+  };
+  // 声音（扬声器）开关，默认关。1.1.7 本就没有音频桥、连接很稳；音频是经一条额外 socket.io 连到实例 kclient，
+  // 为排除它对连接稳定性的影响、并回到 1.1.7 的连接行为，默认不连音频桥；想听声音再开（开关进 effect 依赖，
+  // 关→断开音频桥，开→建立）。
+  const [soundOn, setSoundOn] = useState(() => {
+    try {
+      return window.localStorage.getItem('woc_sound_on') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleSound = () => {
+    const v = !soundOn;
+    setSoundOn(v);
+    try {
+      window.localStorage.setItem('woc_sound_on', v ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  };
+  // 麦克风开关（默认关）：仅在「声音」开启时有意义；默认不抢占麦克风，避免把 AirPods 切到低质通话模式。
+  const [micOn, setMicOn] = useState(() => {
+    try {
+      return window.localStorage.getItem('woc_mic_enabled') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleMic = () => {
+    const v = !micOn;
+    setMicOn(v);
+    try {
+      window.localStorage.setItem('woc_mic_enabled', v ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+    audioRef.current?.setMicEnabled(v);
   };
   const [imeText, setImeText] = useState('');
   const [imeSending, setImeSending] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [starting, setStarting] = useState(false);
   const [control, setControl] = useState<{ free: boolean; mine: boolean; holder: string | null } | null>(null);
-  const [vncNonce, setVncNonce] = useState(0);
   const fileInput = useRef<HTMLInputElement>(null);
   const frameRef = useRef<HTMLIFrameElement>(null);
   const dragDepth = useRef(0);
@@ -178,7 +215,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (!showVnc || frameLoaded) return;
     const t = window.setTimeout(() => setLoadStuck(true), 12000);
     return () => window.clearTimeout(t);
-  }, [showVnc, frameLoaded, id, vncNonce]);
+  }, [showVnc, frameLoaded, id]);
 
   // 探测态收敛：找到实例即结束；否则给共享列表一点刷新时间（AppShell 已在导航时拉取），超时仍无则判定不存在。
   useEffect(() => {
@@ -304,7 +341,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     } catch {
       /* 隐私模式等禁用 localStorage：忽略 */
     }
-  }, [id, vncNonce, inputMode]);
+  }, [id, inputMode]);
 
   // 无感模式：往同源 iframe 装「中文转发 + 有序队列」钩子；切回转发/重连/卸载时自动移除。
   useEffect(() => {
@@ -314,13 +351,13 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (!win || !doc) return;
     const cleanup = installSeamlessIme(win, doc, id);
     return cleanup;
-  }, [inputMode, showVnc, frameLoaded, id, vncNonce]);
+  }, [inputMode, showVnc, frameLoaded, id]);
 
   // 音频/麦克风桥接：实例就绪即自动连接 kclient 的音频流（扬声器恒开，无需手动找工具条）；
   // 仅当本实例处于焦点（标签页可见且窗口聚焦）时出声/收音，失焦立即断开，避免多实例多端串音。
   useEffect(() => {
-    if (!showVnc || !id) return;
-    const audio = new VncAudio(id);
+    if (!showVnc || !id || !soundOn) return; // 声音默认关：未开则完全不连音频桥（回到 1.1.7 无音频的连接行为）
+    const audio = new VncAudio(id, micOn);
     audioRef.current = audio;
     audio.connect();
     const isFocused = () => !document.hidden && document.hasFocus();
@@ -337,7 +374,39 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       audioRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showVnc, id]);
+  }, [showVnc, id, soundOn]);
+
+  // VNC 连接态监测——仅记录、不自动重连/重启。
+  // 1.1.7 本就没有任何"面板侧自动重连/自动重启"，连接很稳；本会话加的自动重载/自动重启(heal)/回前台重载
+  // 反而造成"频繁卡死/重启"的churn，故全部撤掉，回到 1.1.7 的行为：由 noVNC 自带重连兜底，仍不行用户手动
+  // 「重新连接/重启」。这里只把 kasmweb 在 iframe <html> 上的连接态 class 变化回传 [client] 日志，用于排查。
+  useEffect(() => {
+    if (!showVnc || !frameLoaded || !id) return;
+    let lastState = '';
+    const t = window.setInterval(() => {
+      let state = '';
+      try {
+        const c = frameRef.current?.contentDocument?.documentElement?.classList;
+        if (!c) return;
+        state = c.contains('noVNC_connected')
+          ? 'connected'
+          : c.contains('noVNC_reconnecting')
+            ? 'reconnecting'
+            : c.contains('noVNC_connecting')
+              ? 'connecting'
+              : c.contains('noVNC_disconnected')
+                ? 'disconnected'
+                : 'other';
+      } catch {
+        return; // 理论上同源；偶发不可读则跳过本次
+      }
+      if (state && state !== lastState) {
+        lastState = state;
+        api.clientLog(id, `VNC状态→${state}`);
+      }
+    }, 3000);
+    return () => window.clearInterval(t);
+  }, [showVnc, frameLoaded, id]);
 
   if (!id) {
     nav('/', { replace: true });
@@ -495,9 +564,10 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     try {
       await api.instanceRestart(id);
       toast('已重启，正在重连…', 'ok');
-      setFrameLoaded(false);
-      setVncNonce((n) => n + 1); // 强制 iframe 重挂、重连
-      await reload();
+      // 整页重载干净重连：旧 ws 指向已销毁的旧容器，重载后连到全新容器。
+      // 不能页内 bump iframe 重挂——新旧 ws 并存会概率性把 Xvnc 卡死（与 setMode 同理，见上方注释）。
+      // 稍等让新容器的 KasmVNC 起来；noVNC autoconnect+reconnect 会在就绪后自动连上。
+      setTimeout(() => window.location.reload(), 1200);
     } catch (e: any) {
       toast(e.message || '重启失败', 'error');
     }
@@ -566,6 +636,26 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
             >
               剪贴板
             </button>
+            <button
+              className={'ws-action' + (soundOn ? ' on' : '')}
+              title={soundOn ? '声音已开：已连接实例音频。点击关闭（关闭可减少一条到实例的连接，更稳）' : '声音已关：默认不连音频桥（连接更稳）。点此开启以听到实例声音'}
+              onClick={toggleSound}
+            >
+              声音：{soundOn ? '开' : '关'}
+            </button>
+            {soundOn && (
+              <button
+                className={'ws-action' + (micOn ? ' on' : '')}
+                title={
+                  micOn
+                    ? '麦克风已开：占用本机麦克风（AirPods 等可能被切到低音质通话模式）。点击关闭'
+                    : '麦克风已关：不占用麦克风，AirPods 保持高音质输出。需要语音/通话时点此开启'
+                }
+                onClick={toggleMic}
+              >
+                麦克风：{micOn ? '开' : '关'}
+              </button>
+            )}
             {isAdmin && (
               <button className="ws-action" title="重启实例（修复卡死/最小化丢失）" onClick={restartInstance}>
                 重启
@@ -644,8 +734,11 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       ) : (
         <div className="iv-stage iv-stage--vnc">
           <div className="iv-canvas">
+          {/* 切勿给本 iframe 加 key（如 key={id}）：那会让切换实例时 React 重挂 iframe（先删旧元素再建新元素），
+              旧元素被删时 ws 未必干净关闭 → 实例服务端残留半开连接 → 回到该实例再开新 ws 时新旧并存把 Xvnc 卡死
+              （刷新都救不了、要重启容器）。无 key 时切实例只改 src，浏览器会“导航”iframe：旧文档 unload 干净关闭旧 ws，
+              再加载新实例。重连仍走整页重载（见 setMode / 重新连接 / restartInstance）。 */}
           <iframe
-            key={`${id}:${vncNonce}`}
             ref={frameRef}
             className="iv-frame"
             src={desktopUrl(id)}
@@ -653,6 +746,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
             allow="clipboard-read; clipboard-write; microphone; camera; autoplay"
             onLoad={() => {
               setFrameLoaded(true);
+              if (id) api.clientLog(id, 'iframe 已加载（noVNC 页面就绪，开始连 VNC）');
               setTimeout(() => {
                 focusFrame(); // 加载完把键盘焦点交给 VNC
                 injectVncStyle(); // 让原生控制条在深色背景下可见
@@ -681,11 +775,8 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               <div className="iv-stuck-actions">
                 <button
                   className="btn btn-primary"
-                  onClick={() => {
-                    setLoadStuck(false);
-                    setFrameLoaded(false);
-                    setVncNonce((n) => n + 1); // 强制 iframe 重挂、重新请求
-                  }}
+                  onClick={() => window.location.reload()}
+                  title="整页重载干净重连（避免页内重挂导致 ws 并存把 Xvnc 卡死）"
                 >
                   重新连接
                 </button>
@@ -696,7 +787,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                 )}
               </div>
               <div className="iv-loading-sub" style={{ marginTop: 8 }}>
-                管理员也可稍候，面板会自动检测无响应实例并重启自愈。
+                若反复无响应，点「重启实例」即可恢复（数据保留）。
               </div>
             </div>
           )}

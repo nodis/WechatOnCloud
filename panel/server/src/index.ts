@@ -285,6 +285,45 @@ app.get('/api/instances', async (req, reply) => {
   return { instances: out };
 });
 
+// 用户自助「卡死自愈」：当客户端检测到 VNC 多次干净重连仍连不上（多半是实例 KasmVNC 的 ws 接收器卡死——
+// nginx 仍能serve 静态页让 noVNC 显示"正在连接"，但新 ws 永远 accept 不了，刷新/重启面板都无效、只能重启容器），
+// 客户端调用本接口重启该实例（数据卷保留，约十几秒恢复）。需对该实例有访问权；每实例 3 分钟限一次防重启风暴。
+const lastHealAt = new Map<string, number>();
+app.post('/api/instances/:id/heal', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  const now = Date.now();
+  if (now - (lastHealAt.get(id) || 0) < 180000) {
+    return { ok: true, restarted: false, message: '近期已尝试恢复，请稍候重连' };
+  }
+  lastHealAt.set(id, now);
+  appendPanelLog('WARN', `实例「${inst.name}」(id=${id}) 由 ${u.username} 触发卡死自愈（VNC 连不上 → 重启容器，数据保留）`);
+  try {
+    await runInstance(inst);
+    return { ok: true, restarted: true };
+  } catch (e: any) {
+    appendPanelLog('ERROR', `实例「${inst.name}」(id=${id}) 卡死自愈重启失败：${e?.message || e}`);
+    return reply.code(500).send({ error: '恢复失败：' + (e?.message || e) });
+  }
+});
+
+// 客户端连接日志：前端把 VNC 连接态/动作回传，记进实例持久日志（[client] 前缀），与 [vnc] 服务端日志对齐排查。
+app.post('/api/instances/:id/clientlog', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  const msg = String((req.body as any)?.msg ?? '')
+    .replace(/[\r\n]+/g, ' ')
+    .slice(0, 200);
+  if (msg) appendInstanceLog(id, `[client] ${msg}（${u.username}）`);
+  return { ok: true };
+});
+
 // 新建实例（仅管理员）：生成凭据 + docker run + 分配访问账户
 app.post('/api/admin/instances', async (req, reply) => {
   const admin = requireAdmin(req, reply);
@@ -930,6 +969,10 @@ proxy.on('proxyReq', (proxyReq, req) => {
 proxy.on('proxyReqWs', (proxyReq, req) => {
   const auth = (req as any)._wocAuth;
   if (auth) proxyReq.setHeader('authorization', auth);
+  // 上游（实例 nginx → KasmVNC websockify）回 101 = ws 接收器接受了连接，桌面真正连上。
+  // 卡死时这条不会出现（接收器停止 accept），即可定位"卡在面板→实例之间还是实例内部"。
+  const instId = (req as any)._wocInstId;
+  if (instId) proxyReq.on('upgrade', () => appendInstanceLog(instId, '[vnc] 上游已接受(101) · 桌面连接建立'));
 });
 // 兜底：剥掉 KasmVNC 401 的 WWW-Authenticate 头，避免浏览器弹出原生 Basic Auth 登录框。
 // 正常路径下我们已注入正确凭据（不会 401）；万一凭据失配，宁可桌面加载失败也绝不把登录弹窗暴露给用户。
@@ -1028,7 +1071,17 @@ app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) =>
   const inst = findInstance(parsed.id)!;
   req.url = parsed.rest;
   (req as any)._wocAuth = basicAuth(inst);
-  proxy.ws(req, socket, head, { target: instanceTarget(inst) });
+  (req as any)._wocInstId = inst.id;
+  // 远程桌面连接日志：记录每次 ws 连接尝试 / 上游接受(在 proxyReqWs 里) / 失败 / 关闭时长。
+  // 与实例容器内 KasmVNC 的 "got client connection" 按时间对齐，即可看出卡在哪一段。
+  const ip = (req.socket && req.socket.remoteAddress) || '?';
+  const uname = (u as any).username || '?';
+  appendInstanceLog(inst.id, `[vnc] 连接尝试 user=${uname} ip=${ip}`);
+  const t0 = Date.now();
+  socket.on('close', () => appendInstanceLog(inst.id, `[vnc] 连接关闭（持续 ${Math.round((Date.now() - t0) / 1000)}s）`));
+  proxy.ws(req, socket, head, { target: instanceTarget(inst) }, (err: any) => {
+    appendInstanceLog(inst.id, `[vnc] 连接失败：${err?.message || err}`);
+  });
 });
 
 // 探测面板网络 + 重启后把已登记实例的容器拉起来
