@@ -76,9 +76,10 @@ export interface VolEntry {
 }
 
 export interface VersionInfo {
-  current: string; // 当前构建版本（如 v1.2.0 / dev）
+  current: string; // 当前构建版本（如 v1.2.0 / dev-<sha>）
   latest: string | null; // 仓库上最新发布版（如 v1.2.1）；查不到为 null
-  hasUpdate: boolean; // 有更高的语义化版本可用
+  hasUpdate: boolean; // 有可升级目标（正式版：latest>current；开发版：查到任一正式版）
+  isDev: boolean; // 当前是开发版（非正式 vX.Y.Z）
   checkedAt: number; // 上次检查时间戳（ms）；0=尚未检查
   source: string | null; // 数据来源：dockerhub / ghcr / dockerhub+ghcr
   error: string | null; // 检查失败原因
@@ -246,4 +247,39 @@ export const api = {
   controlTake: (id: string) => req<{ mine: boolean; holder: string }>(`/api/instances/${id}/control/take`, { method: 'POST' }),
   typeInInstance: (id: string, text: string) => req(`/api/instances/${id}/type`, { method: 'POST', body: JSON.stringify({ text }) }),
   keyInInstance: (id: string, key: string) => req(`/api/instances/${id}/key`, { method: 'POST', body: JSON.stringify({ key }) }),
+
+  // 桌面壁纸
+  listBackgrounds: (id: string) => req<{ backgrounds: string[] }>(`/api/admin/instances/${id}/backgrounds`),
+  uploadBackground: async (id: string, name: string, file: File) => {
+    const res = await fetch(`/api/admin/instances/${id}/backgrounds?name=${encodeURIComponent(name)}`, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'content-type': 'application/octet-stream' }, body: file,
+    });
+    if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as any).error || '上传失败');
+    return res.json();
+  },
+  applyBackground: (id: string, name: string) =>
+    req(`/api/admin/instances/${id}/backgrounds/${encodeURIComponent(name)}/apply`, { method: 'POST' }),
+  deleteBackground: (id: string, name: string) =>
+    req(`/api/admin/instances/${id}/backgrounds/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  getCurrentBackground: (id: string) => req<{ background: string }>(`/api/admin/instances/${id}/backgrounds/current`),
+  clearBackground: (id: string) => req(`/api/admin/instances/${id}/backgrounds/clear`, { method: 'POST' }),
+
+  // 字体管理
+  listFonts: (id: string) => req<{ fonts: string[] }>(`/api/admin/instances/${id}/fonts`),
+  uploadFont: async (id: string, name: string, file: File) => {
+    const res = await fetch(`/api/admin/instances/${id}/fonts?name=${encodeURIComponent(name)}`, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'content-type': 'application/octet-stream' }, body: file,
+    });
+    if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as any).error || '上传失败');
+    return res.json();
+  },
+  deleteFont: (id: string, name: string) =>
+    req(`/api/admin/instances/${id}/fonts/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  getCurrentFont: (id: string) => req<{ fontFile: string }>(`/api/admin/instances/${id}/fonts/current`),
+  applyFont: (id: string, name: string) =>
+    req(`/api/admin/instances/${id}/fonts/${encodeURIComponent(name)}/apply`, { method: 'POST' }),
+  resetFontDefault: (id: string) =>
+    req(`/api/admin/instances/${id}/fonts/default`, { method: 'POST' }),
 };
