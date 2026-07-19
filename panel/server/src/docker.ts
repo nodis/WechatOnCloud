@@ -1048,7 +1048,7 @@ export async function buildDiagnostics(instances: Instance[], sinceMs: number, m
       '  system.txt        系统/Docker/镜像信息',
       '  panel.log         面板全局运维日志（创建/删除/升级/启停/镜像拉取/错误）',
       '  containers.txt    所有 woc-* 容器清单（含残留/未登记）',
-      '  instances/<id>.log 每个实例：容器状态 + 持久日志 + 实时容器日志',
+      '  instances/<id>.log 每个实例：容器状态 + 持久日志 + 应用安装状态/日志 + 实时容器日志',
       '',
       '把本压缩包发给维护者即可协助排查（不含密码/密钥等敏感信息）。',
     ].join('\n'),
@@ -1117,6 +1117,18 @@ export async function buildDiagnostics(instances: Instance[], sinceMs: number, m
       c += `===== 容器状态 =====\n无法读取（容器可能未创建/已删除）：${e?.message || e}\n\n`;
     }
     c += `===== 持久化日志（最近 ${meta.range || '24h'}） =====\n${filterSince(readInstanceLog(inst.id), sinceMs) || '（无）'}\n\n`;
+    // 应用安装状态 + 安装日志：排查「下载卡住/装不上」（此前诊断包里完全看不到安装为何失败）。
+    // status.json = 面板轮询的进度/错误；install.log = wechat-ctl.sh 下载/解压每步（含 curl 退出码、已下字节）。
+    try {
+      // `|| true`：文件不存在时 cat/tail 会以非 0 退出，execCapture 视作失败抛错——加 || true 保证退出 0，
+      // 拿到空串走下面的「（无）」分支，不因"还没装/旧镜像无日志"就整段丢失。
+      const st = (await execCapture(inst, ['sh', '-c', 'cat /config/.woc-state/status.json 2>/dev/null || true'])).trim();
+      c += `===== 应用安装状态（status.json） =====\n${st || '（无 / 尚未触发安装）'}\n\n`;
+      const il = (await execCapture(inst, ['sh', '-c', 'tail -n 50 /config/.woc-state/install.log 2>/dev/null || true'])).trimEnd();
+      c += `===== 安装日志（install.log 尾 50 行） =====\n${il || '（无 / 旧镜像未记录）'}\n\n`;
+    } catch (e: any) {
+      c += `===== 应用安装状态 / 安装日志 =====\n获取失败（容器可能未运行）：${e?.message || e}\n\n`;
+    }
     try {
       c += `===== 本次容器日志（实时 tail 300） =====\n${(await instanceLogs(inst, 300)).trimEnd() || '（无）'}\n`;
     } catch (e: any) {
